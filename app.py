@@ -72,6 +72,8 @@ def init_db():
         'CREATE TABLE IF NOT EXISTS profiles (username VARCHAR(64) PRIMARY KEY, full_name VARCHAR(100) NOT NULL, email VARCHAR(254) UNIQUE NOT NULL)',
         'CREATE TABLE IF NOT EXISTS checks (event_id VARCHAR(32) PRIMARY KEY, username VARCHAR(64) NOT NULL, record_id VARCHAR(64) NOT NULL, found INTEGER NOT NULL, checked_at BIGINT NOT NULL)',
         'CREATE INDEX IF NOT EXISTS checks_user_time ON checks (username, checked_at)',
+        'CREATE TABLE IF NOT EXISTS record_assets (record_id VARCHAR(64) PRIMARY KEY, text_content TEXT NOT NULL, image_id VARCHAR(32), video_id VARCHAR(32))',
+        'CREATE TABLE IF NOT EXISTS media (id VARCHAR(32) PRIMARY KEY, kind VARCHAR(8) NOT NULL, content_type VARCHAR(64) NOT NULL, payload ' + ('BYTEA' if DATABASE_URL else 'BLOB') + ' NOT NULL, created_at BIGINT NOT NULL)',
         'CREATE TABLE IF NOT EXISTS record_details (id VARCHAR(64) PRIMARY KEY, name VARCHAR(120) NOT NULL, description TEXT NOT NULL, active INTEGER NOT NULL, version INTEGER NOT NULL)',
         'CREATE TABLE IF NOT EXISTS audit (event_id VARCHAR(32) PRIMARY KEY, username VARCHAR(64) NOT NULL, action VARCHAR(32) NOT NULL, record_id VARCHAR(64) NOT NULL, before_json TEXT NOT NULL, after_json TEXT NOT NULL, created_at BIGINT NOT NULL)',
         'CREATE TABLE IF NOT EXISTS account_status (username VARCHAR(64) PRIMARY KEY, verified INTEGER NOT NULL)',
@@ -108,7 +110,7 @@ def current_user(environ):
     token = session_token(environ)
     if not token:
         return None
-    return query('SELECT u.username, u.role FROM sessions s JOIN users u ON u.username = s.username WHERE s.token_hash = ? AND s.expires_at > ?', (hashlib.sha256(token.encode()).hexdigest(), int(time.time())), True)
+    return query('SELECT u.username, u.role FROM sessions s JOIN users u ON u.username = s.username WHERE s.token_hash = ? AND s.expires_at > ? AND u.role = \'admin\'', (hashlib.sha256(token.encode()).hexdigest(), int(time.time())), True)
 
 def require_user(environ, admin=False):
     user = current_user(environ)
@@ -150,6 +152,61 @@ RECORD_SELECT = 'SELECT r.id, COALESCE(d.name, \'\'), COALESCE(d.description, \'
 def record_dict(row):
     return {'id': row[0], 'name': row[1], 'description': row[2], 'active': bool(row[3]), 'version': row[4]} if row else None
 
+def enrich_record(conn, item):
+    if not item:
+        return None
+    row = execute(conn, 'SELECT text_content, image_id, video_id FROM record_assets WHERE record_id = ?', (item['id'],)).fetchone()
+    item.update(text=row[0] if row else item['description'], image_id=row[1] if row else None, video_id=row[2] if row else None)
+    return item
+
+def public_base(environ):
+    base = os.environ.get('PUBLIC_BASE_URL') or os.environ.get('RENDER_EXTERNAL_URL')
+    return (base or environ.get('wsgi.url_scheme', 'http') + '://' + environ.get('HTTP_HOST', 'localhost')).rstrip('/')
+
+def upload_media(environ):
+    require_user(environ, admin=True)
+    mime = environ.get('CONTENT_TYPE', '').split(';')[0].lower()
+    kinds = {'image/jpeg':'image', 'image/png':'image', 'image/webp':'image', 'video/mp4':'video', 'video/webm':'video'}
+    kind = kinds.get(mime)
+    if not kind:
+        raise ApiError(400, 'الصور JPEG/PNG/WebP والفيديو MP4/WebM فقط')
+    length = int(environ.get('CONTENT_LENGTH') or 0)
+    maximum = 5*1024*1024 if kind == 'image' else 25*1024*1024
+    if not 1 <= length <= maximum:
+        raise ApiError(400, 'الحد 5 ميجابايت للصورة و25 ميجابايت للفيديو')
+    payload = environ['wsgi.input'].read(length)
+    signatures = {'image/jpeg': payload.startswith(b'\xff\xd8\xff'), 'image/png':payload.startswith(b'\x89PNG\r\n\x1a\n'), 'image/webp':payload[:4]==b'RIFF' and payload[8:12]==b'WEBP', 'video/mp4':len(payload)>12 and payload[4:8]==b'ftyp', 'video/webm':payload.startswith(b'\x1a\x45\xdf\xa3')}
+    if len(payload) != length or not signatures[mime]:
+        raise ApiError(400, 'محتوى الملف لا يطابق نوع الصورة أو الفيديو')
+    media_id = secrets.token_hex(16)
+    query('INSERT INTO media (id, kind, content_type, payload, created_at) VALUES (?, ?, ?, ?, ?)', (media_id, kind, mime, payload, int(time.time())))
+    return 201, {'id':media_id,'kind':kind,'url':public_base(environ)+'/media/'+media_id}
+
+def serve_media(environ, extra_headers):
+    media_id = environ.get('PATH_INFO','').split('/')[-1]
+    if not re.fullmatch(r'[a-f0-9]{32}', media_id):
+        raise ApiError(404, 'الملف غير متاح')
+    row = query('SELECT m.content_type, m.payload FROM media m WHERE m.id = ? AND EXISTS (SELECT 1 FROM record_assets a JOIN records r ON r.id = a.record_id LEFT JOIN record_details d ON d.id = r.id WHERE (a.image_id = m.id OR a.video_id = m.id) AND COALESCE(d.active,1) = 1)', (media_id,), True)
+    if not row:
+        raise ApiError(404, 'الملف غير متاح')
+    body = bytes(row[1]);total=len(body);code=200
+    extra_headers.extend([('Accept-Ranges','bytes'),('Access-Control-Allow-Origin','*')])
+    requested = environ.get('HTTP_RANGE')
+    if requested:
+        match=re.fullmatch(r'bytes=(\d*)-(\d*)',requested)
+        if not match or not any(match.groups()):
+            extra_headers.append(('Content-Range','bytes */'+str(total)))
+            raise ApiError(416, 'نطاق غير صالح')
+        first,last=match.groups()
+        start=int(first) if first else max(0,total-int(last))
+        end=min(int(last),total-1) if first and last else total-1
+        if start >= total or end < start:
+            extra_headers.append(('Content-Range','bytes */'+str(total)))
+            raise ApiError(416, 'نطاق غير صالح')
+        body=body[start:end+1];code=206
+        extra_headers.append(('Content-Range',f'bytes {start}-{end}/{total}'))
+    return code,row[0],body
+
 def log_audit(conn, username, action, record_id, before, after):
     execute(conn, 'INSERT INTO audit (event_id, username, action, record_id, before_json, after_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)', (secrets.token_hex(16), username, action, record_id, json.dumps(before, ensure_ascii=False), json.dumps(after, ensure_ascii=False), int(time.time())))
 
@@ -158,7 +215,16 @@ def integrity_error(exc):
 
 def save_record(conn, username, data, update=False):
     value = record_data(data)
-    before = record_dict(execute(conn, RECORD_SELECT + ' WHERE r.id = ?', (value['id'],)).fetchone())
+    before = enrich_record(conn, record_dict(execute(conn, RECORD_SELECT + ' WHERE r.id = ?', (value['id'],)).fetchone()))
+    text = data.get('text', before.get('text', '') if before else value['description'])
+    if not isinstance(text, str) or len(text) > 10000:
+        raise ApiError(400, 'النص يجب ألا يتجاوز 10000 حرف')
+    value['text'] = text
+    for field, kind in [('image_id', 'image'), ('video_id', 'video')]:
+        asset = data.get(field, before.get(field) if before else None)
+        if asset is not None and (not isinstance(asset, str) or not re.fullmatch(r'[a-f0-9]{32}', asset) or not execute(conn, 'SELECT id FROM media WHERE id = ? AND kind = ?', (asset, kind)).fetchone()):
+            raise ApiError(400, 'ملف الصورة أو الفيديو غير صالح')
+        value[field] = asset
     if update:
         if not before:
             raise ApiError(404, 'الرقم غير موجود')
@@ -178,6 +244,7 @@ def save_record(conn, username, data, update=False):
         execute(conn, 'INSERT INTO record_details (id, name, description, active, version) VALUES (?, ?, ?, ?, 1)', (value['id'], value['name'], value['description'], int(value['active'])))
         value['version'] = 1
         action = 'create'
+    execute(conn, 'INSERT INTO record_assets (record_id, text_content, image_id, video_id) VALUES (?, ?, ?, ?) ON CONFLICT (record_id) DO UPDATE SET text_content = excluded.text_content, image_id = excluded.image_id, video_id = excluded.video_id', (value['id'], value['text'], value['image_id'], value['video_id']))
     log_audit(conn, username, action, value['id'], before, value)
     return value
 
@@ -240,36 +307,13 @@ def use_email_token(data, purpose):
 
 def handle(environ, extra_headers, cookie_flags):
     path, method = environ.get('PATH_INFO', ''), environ['REQUEST_METHOD']
+    if path == '/api/register':
+        raise ApiError(403, 'التسجيل العام غير مطلوب. التطبيق يفحص الرقم دون حساب')
+    if path == '/api/media' and method == 'POST':
+        return upload_media(environ)
     if path == '/health' and method == 'GET':
         query('SELECT 1', fetch=True)
         return 200, {'status': 'ok'}
-    if path == '/api/register' and method == 'POST':
-        rate_limit(environ, 'register', limit=10)
-        data = read_json(environ)
-        username, password, full_name, email = (data.get(key) for key in ('username', 'password', 'full_name', 'email'))
-        if not all(isinstance(v, str) for v in (username, password, full_name, email)):
-            raise ApiError(400, 'تحقق من بيانات التسجيل')
-        username, full_name, email = username.strip().lower(), full_name.strip(), email.strip().lower()
-        valid_password(password)
-        if not re.fullmatch(r'[a-z0-9_]{3,32}', username) or not 2 <= len(full_name) <= 100 or len(email) > 254 or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email):
-            raise ApiError(400, 'أدخل اسماً وبريداً صحيحين واسم مستخدم من 3–32 حرفاً إنجليزياً أو رقماً أو _')
-        try:
-            with database() as conn:
-                execute(conn, 'INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)', (username, password_hash(password), 'user'))
-                execute(conn, 'INSERT INTO profiles (username, full_name, email) VALUES (?, ?, ?)', (username, full_name, email))
-                execute(conn, 'INSERT INTO account_status (username, verified) VALUES (?, 0)', (username,))
-        except Exception as exc:
-            if integrity_error(exc):
-                raise ApiError(409, 'اسم المستخدم أو البريد مستخدم من قبل')
-            raise
-        sent = False
-        if mail_configured():
-            try:
-                issue_email(username, email, 'verify')
-                sent = True
-            except ApiError:
-                pass
-        return 201, {'registered': True, 'username': username, 'role': 'user', 'verification_required': True, 'email_sent': sent, 'message': 'تم إنشاء الحساب. افتح رابط التفعيل المرسل لبريدك.' if sent else 'تم إنشاء الحساب بانتظار التفعيل. إرسال البريد يحتاج إعداد خدمة البريد أو إعادة المحاولة.'}
     if path == '/api/login' and method == 'POST':
         rate_limit(environ, 'login', limit=30)
         data = read_json(environ)
@@ -280,6 +324,8 @@ def handle(environ, extra_headers, cookie_flags):
         user = query('SELECT password_hash, role FROM users WHERE username = ?', (username,), True)
         if not password_matches(password, user[0] if user else 'dummy:' + ('0' * 64)) or not user:
             raise ApiError(401, 'اسم المستخدم أو كلمة المرور غير صحيحة')
+        if user[1] != 'admin':
+            raise ApiError(403, 'هذه الصفحة للأدمن فقط. فحص التطبيق لا يحتاج حساباً')
         verified = query('SELECT verified FROM account_status WHERE username = ?', (username,), True)
         if not verified or not verified[0]:
             raise ApiError(403, 'فعّل حسابك من رابط البريد أولاً. يمكنك طلب إعادة إرسال التفعيل')
@@ -372,14 +418,16 @@ def handle(environ, extra_headers, cookie_flags):
         history = rows('SELECT record_id, found, checked_at FROM checks WHERE username = ? ORDER BY checked_at DESC, event_id DESC LIMIT 10', (user[0],))
         result = {'full_name': profile[0] if profile else user[0], 'checks': stats[0], 'matches': stats[1], 'history': [{'id': r[0], 'exists': bool(r[1]), 'checked_at': r[2]} for r in history]}
         if user[1] == 'admin':
-            result.update(records=query('SELECT COUNT(*) FROM records', fetch=True)[0], users=query('SELECT COUNT(*) FROM users', fetch=True)[0], email_configured=mail_configured())
+            result.update(records=query('SELECT COUNT(*) FROM records', fetch=True)[0], users=query("SELECT COUNT(*) FROM users WHERE role = 'admin'", fetch=True)[0], email_configured=mail_configured())
         return 200, result
     if path == '/api/check' and method == 'POST':
-        user = require_user(environ)
         record_id = valid_id(read_json(environ).get('id'))
-        item = record_dict(query(RECORD_SELECT + ' WHERE r.id = ?', (record_id,), True))
-        query('INSERT INTO checks (event_id, username, record_id, found, checked_at) VALUES (?, ?, ?, ?, ?)', (secrets.token_hex(16), user[0], record_id, int(item is not None), int(time.time())))
-        return 200, {'id': record_id, 'exists': item is not None, 'active': item['active'] if item else False, 'name': item['name'] if item else '', 'description': item['description'] if item else ''}
+        with database() as conn:
+            item = enrich_record(conn, record_dict(execute(conn, RECORD_SELECT + ' WHERE r.id = ?', (record_id,)).fetchone()))
+        if not item or not item['active']:
+            return 200, {'available': False, 'message': 'غير متاح'}
+        base = public_base(environ)
+        return 200, {'available': True, 'message': 'متاح', 'id': item['id'], 'text': item['text'], 'image_url': base+'/media/'+item['image_id'] if item['image_id'] else None, 'video_url': base+'/media/'+item['video_id'] if item['video_id'] else None}
     if path == '/api/records' and method == 'GET':
         require_user(environ, admin=True)
         params = parse_qs(environ.get('QUERY_STRING', ''))
@@ -389,16 +437,19 @@ def handle(environ, extra_headers, cookie_flags):
         where = " WHERE r.id LIKE ? ESCAPE '!' OR d.name LIKE ? ESCAPE '!'"
         total = query('SELECT COUNT(*) FROM records r LEFT JOIN record_details d ON d.id = r.id' + where, (pattern, pattern), True)[0]
         items = rows(RECORD_SELECT + where + ' ORDER BY r.id LIMIT 20 OFFSET ?', (pattern, pattern, (page - 1) * 20))
-        return 200, {'items': [record_dict(r) for r in items], 'total': total, 'page': page, 'page_size': 20}
+        with database() as conn:
+            items = [enrich_record(conn, record_dict(r)) for r in items]
+        return 200, {'items': items, 'total': total, 'page': page, 'page_size': 20}
     if path == '/api/records' and method in ('POST', 'PATCH', 'DELETE'):
         user = require_user(environ, admin=True)
-        data = read_json(environ)
+        data = read_json(environ, limit=65536)
         with database() as conn:
             if method == 'DELETE':
                 record_id = valid_id(data.get('id'))
-                before = record_dict(execute(conn, RECORD_SELECT + ' WHERE r.id = ?', (record_id,)).fetchone())
+                before = enrich_record(conn, record_dict(execute(conn, RECORD_SELECT + ' WHERE r.id = ?', (record_id,)).fetchone()))
                 if not before:
                     raise ApiError(404, 'الرقم غير موجود')
+                execute(conn, 'DELETE FROM record_assets WHERE record_id = ?', (record_id,))
                 execute(conn, 'DELETE FROM record_details WHERE id = ?', (record_id,))
                 execute(conn, 'DELETE FROM records WHERE id = ?', (record_id,))
                 log_audit(conn, user[0], 'delete', record_id, before, None)
@@ -469,9 +520,15 @@ def application(environ, start_response):
     code, result, body = 200, None, b''
     try:
         origin = environ.get('HTTP_ORIGIN')
-        if method in ('POST', 'PATCH', 'DELETE') and origin and urlsplit(origin).netloc != environ.get('HTTP_HOST', ''):
+        if path != '/api/check' and method in ('POST', 'PATCH', 'DELETE') and origin and urlsplit(origin).netloc != environ.get('HTTP_HOST', ''):
             raise ApiError(403, 'Origin not allowed')
-        if path == '/' and method == 'GET':
+        if path == '/api/check':
+            extra_headers.extend([('Access-Control-Allow-Origin','*'),('Access-Control-Allow-Methods','POST, OPTIONS'),('Access-Control-Allow-Headers','Content-Type')])
+        if path == '/api/check' and method == 'OPTIONS':
+            result = {}
+        elif path.startswith('/media/') and method == 'GET':
+            code, content_type, body = serve_media(environ, extra_headers)
+        elif path == '/' and method == 'GET':
             content_type = 'text/html; charset=utf-8'
             body = Path(__file__).with_name('index.html').read_bytes()
         elif path == '/static/zxing-browser.min.js' and method == 'GET':
@@ -493,7 +550,7 @@ def application(environ, start_response):
         code, result = 503, {'error': 'الخدمة غير متاحة حالياً'}
     if result is not None:
         body = json.dumps(result, ensure_ascii=False).encode()
-    reasons = {200:'OK',201:'Created',400:'Bad Request',401:'Unauthorized',403:'Forbidden',404:'Not Found',409:'Conflict',429:'Too Many Requests',503:'Service Unavailable'}
+    reasons = {206:'Partial Content',416:'Range Not Satisfiable',200:'OK',201:'Created',400:'Bad Request',401:'Unauthorized',403:'Forbidden',404:'Not Found',409:'Conflict',429:'Too Many Requests',503:'Service Unavailable'}
     start_response(str(code) + ' ' + reasons.get(code, 'Error'), [('Content-Type', content_type), ('Content-Length', str(len(body))), ('Cache-Control', 'no-store'), ('X-Content-Type-Options', 'nosniff'), ('X-Frame-Options', 'DENY'), ('Referrer-Policy', 'no-referrer'), ('Permissions-Policy', 'camera=(self)'), ('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; media-src 'self' blob:; frame-ancestors 'none'")] + extra_headers)
     return [body]
 
