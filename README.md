@@ -1,83 +1,54 @@
-# مشروع فحص ID
+# بوابة فحص الأرقام مع تسجيل الدخول
 
-باك إند Python مع PostgreSQL على Render، وSQLite للتجربة المحلية.
-الأرقام تخزن كنص للحفاظ على الأصفار مثل 00123. لا توجد بيانات تجريبية مضافة تلقائياً.
+## الحسابات
 
-## النشر على Render
+| الحساب | كلمة المرور | الصلاحيات |
+| --- | --- | --- |
+| abo_liath | 123456 | الفحص والإضافة والحذف |
+| jehad | 123456 | الفحص فقط |
 
-1. فك ضغط الملف.
-2. أنشئ مستودع GitHub وارفع محتويات مجلد id-check-api. اجعل render.yaml في جذر المستودع.
-3. في Render اختر New ثم Blueprint واربط المستودع.
-4. راجع الخدمتين id-check-api وid-check-db ثم اضغط Deploy Blueprint.
-5. بعد نجاح النشر افتح رابط خدمة id-check-api.
-6. من Environment داخل الخدمة انسخ قيمة ADMIN_TOKEN. استخدمها في صفحة الخدمة لإضافة أول ID.
-7. أدخل ID واضغط فحص الرقم.
+كلمات المرور تخزن كهاش PBKDF2 مع salt مستقل. الجلسة مدتها 8 ساعات، وتلغى عند تسجيل الخروج. الصلاحيات تطبق في الباك إند. الحسابان ينشآن عند التشغيل الأول ولا يستبدلان الحسابات الحالية. جدول records الحالي يبقى كما هو.
 
-هذه الإعدادات تستخدم Free للتجربة. قاعدة Render المجانية تنتهي بعد 30 يوماً. للاستمرار اختر خطة قاعدة بيانات مدفوعة أو اربط PostgreSQL خارجي عبر DATABASE_URL. خدمة الويب المجانية قد تتوقف عند عدم الاستخدام، لذلك قد يتأخر أول طلب.
+## تحديث المشروع الموجود
 
-لا ترسل كلمة سر الإدارة لتطبيق الموبايل. واجهة الفحص مفتوحة عبر الإنترنت في هذه النسخة. إذا كانت الأرقام حساسة، أضف تسجيل دخول للمستخدمين قبل استخدامها. رمز مشترك داخل تطبيق الموبايل لا يوفر حماية مناسبة.
+ارفع ملفات app.py وindex.html وtest_app.py وREADME.md إلى نفس مستودع GitHub بدلاً من النسخ السابقة. لا تنشئ Blueprint أو قاعدة بيانات جديدة. إعداد render.yaml وrequirements.txt الحالي يعمل كما هو. ADMIN_TOKEN القديم لم يعد مستخدماً.
 
-## طلب تطبيق الموبايل
+بعد Commit changes، افتح الخدمة في Render وانتظر نجاح نشر التعديل. إذا لم يبدأ تلقائياً استخدم Manual Deploy ثم Deploy latest commit. افتح الموقع وسجّل الدخول بالحساب المطلوب.
 
-POST https://YOUR-SERVICE.onrender.com/api/check
-Content-Type: application/json
+## التشغيل المحلي
 
+```bash
+python3 app.py
+```
+
+افتح http://localhost:8000. SQLite محلياً وPostgreSQL عبر DATABASE_URL على Render.
+
+## API للموبايل
+
+POST /api/login
+```json
+{"username":"jehad","password":"123456"}
+```
+
+يرجع username وrole وtoken. أرسل token في الطلبات اللاحقة داخل Authorization: Bearer TOKEN. في الويب تستخدم الجلسة Cookie من نوع HttpOnly وSameSite=Strict وSecure على Render.
+
+POST /api/check
 ```json
 {"id":"00123"}
 ```
 
-إذا كان موجوداً
-```json
-{"id":"00123","exists":true}
-```
+يرجع {"id":"00123","exists":true} أو false. ID نص بطول 1 إلى 64 من الحروف الإنجليزية والأرقام والشرطة والشرطة السفلية.
 
-إذا لم يكن موجوداً
-```json
-{"id":"00123","exists":false}
-```
+POST /api/records للإضافة وDELETE /api/records للحذف بنفس الجسم، للأدمن فقط.
+GET /api/me لبيانات الحساب الحالي. POST /api/logout لإلغاء الجلسة.
+401 يعني الدخول مطلوب أو الجلسة انتهت. 403 يعني العملية غير مسموحة. 400 يعني المدخلات غير صالحة. 503 يعني تعذر الوصول للخدمة، ولا يعامل كأن الرقم غير موجود.
 
-النتيجتان HTTP 200. البيانات غير الصالحة HTTP 400. تعذر الوصول لقاعدة البيانات HTTP 503 ويجب أن يعرض التطبيق مشكلة اتصال، وليس أن الرقم غير موجود.
-
-مثال JavaScript
-```javascript
-const response = await fetch(`${API_URL}/api/check`, {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ id: '00123' })
-});
-if (!response.ok) throw new Error('Request failed');
-const { exists } = await response.json();
-```
-
-## الإدارة عبر API
-
-POST /api/records لإضافة رقم. DELETE /api/records لحذفه.
-نفس JSON السابق مع Authorization: Bearer YOUR_ADMIN_TOKEN.
-الإضافة المتكررة لا تنشئ صفاً مكرراً. حد الطلب 4096 بايت. ID يقبل حروف إنجليزية وأرقاماً وشرطة وشرطة سفلية بطول 1 إلى 64.
-
-## التشغيل المحلي
-
-Python 3.11 أو أحدث. لا تحتاج تثبيت مكتبات للتجربة المحلية.
-
-Windows PowerShell
-```powershell
-$env:ADMIN_TOKEN="choose-a-long-random-secret"
-python app.py
-```
-
-macOS / Linux
-```bash
-export ADMIN_TOKEN='choose-a-long-random-secret'
-python3 app.py
-```
-
-افتح http://localhost:8000. استخدم كلمة السر التي اخترتها عند إضافة الأرقام.
-البيانات المحلية تحفظ في local.db، ولا ترفع هذا الملف إلى GitHub.
-
-## التحقق
+## الاختبارات
 
 ```bash
 python3 -m unittest -v
 ```
 
-الاختبارات تغطي الإضافة والفحص والحذف والصلاحيات والتحقق من المدخلات وحفظ الأصفار ومنع حقن SQL. الاختبارات تستخدم SQLite. اتصال PostgreSQL والنشر على Render يحتاجان اختباراً بعد النشر.
+التحقق المحلي يستخدم SQLite ويغطي الحسابين والدخول والخروج وانتهاء الجلسة والصلاحيات والإضافة والفحص والحذف. اتصال PostgreSQL واختبار الصفحة على Render يتمان بعد النشر.
+
+هذه نسخة تجربة بكلمات المرور المطلوبة. لا تتضمن تقييد محاولات الدخول أو تغيير كلمات المرور عبر الواجهة. يجب إضافة ذلك وتغيير كلمات المرور قبل الاستخدام الفعلي.
