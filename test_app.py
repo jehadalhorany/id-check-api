@@ -45,6 +45,33 @@ class ApiTest(unittest.TestCase):
     def test_expiry(self):
         app.query('UPDATE sessions SET expires_at = 0')
         self.assertEqual(self.request('/api/check',data={'id':'123'})[0],401)
+    def test_registration_role_and_duplicates(self):
+        data={'username':'new_user','password':'StrongPass123','full_name':'Test User','email':'test@example.com','role':'admin'}
+        self.assertEqual(self.request('/api/register',data=data)[0],201)
+        self.assertEqual(self.request('/api/register',data=data)[0],409)
+        copy=dict(data,username='other_user')
+        self.assertEqual(self.request('/api/register',data=copy)[0],409)
+        self.assertIsNone(app.query('SELECT role FROM users WHERE username = ?',('other_user',),True))
+        login=self.request('/api/login',data={'username':'new_user','password':'StrongPass123'})[1]
+        self.assertEqual(login['role'],'user')
+        token='Bearer '+login['token']
+        self.assertEqual(self.request('/api/records',data={'id':'999'},token=token)[0],403)
+        self.assertEqual(self.request('/api/register',data=dict(data,username='shortpw',email='new@example.com',password='123'))[0],400)
+    def test_history_isolation_and_stats(self):
+        self.request('/api/records',data={'id':'00123'},token='Bearer '+self.admin)
+        self.request('/api/check',data={'id':'00123'})
+        self.request('/api/check',data={'id':'missing'})
+        dash=self.request('/api/dashboard','GET')[1]
+        self.assertEqual(dash['checks'],2)
+        self.assertEqual(dash['matches'],1)
+        self.assertEqual(len(dash['history']),2)
+        self.assertNotIn('users',dash)
+        admin=self.request('/api/dashboard','GET',token='Bearer '+self.admin)[1]
+        self.assertEqual(admin['checks'],0)
+        self.assertEqual(admin['history'],[])
+        self.assertEqual(admin['records'],1)
+        self.assertEqual(admin['users'],2)
+        self.assertEqual(self.request('/api/dashboard','GET',token='')[0],401)
     def test_validation(self):
         for data in [{'id':123},{'id':''},{'id':'a'*65},{'id':"x' OR 1=1 --"},[],None]:
             self.assertEqual(self.request('/api/check',data=data)[0],400)

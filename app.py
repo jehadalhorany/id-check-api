@@ -39,6 +39,9 @@ def init_db():
         conn.execute('CREATE TABLE IF NOT EXISTS records (id VARCHAR(64) PRIMARY KEY)')
         conn.execute('CREATE TABLE IF NOT EXISTS users (username VARCHAR(64) PRIMARY KEY, password_hash TEXT NOT NULL, role VARCHAR(16) NOT NULL)')
         conn.execute('CREATE TABLE IF NOT EXISTS sessions (token_hash VARCHAR(64) PRIMARY KEY, username VARCHAR(64) NOT NULL, expires_at BIGINT NOT NULL)')
+        conn.execute('CREATE TABLE IF NOT EXISTS profiles (username VARCHAR(64) PRIMARY KEY, full_name VARCHAR(100) NOT NULL, email VARCHAR(254) UNIQUE NOT NULL)')
+        conn.execute('CREATE TABLE IF NOT EXISTS checks (event_id VARCHAR(32) PRIMARY KEY, username VARCHAR(64) NOT NULL, record_id VARCHAR(64) NOT NULL, found INTEGER NOT NULL, checked_at BIGINT NOT NULL)')
+        conn.execute('CREATE INDEX IF NOT EXISTS checks_user_time ON checks (username, checked_at)')
         for username, role in [('abo_liath', 'admin'), ('jehad', 'user')]:
             salt = secrets.token_hex(16)
             digest = hashlib.pbkdf2_hmac('sha256', b'123456', salt.encode(), 300000).hex()
@@ -94,6 +97,42 @@ def application(environ, start_response):
         elif path == '/health' and method == 'GET':
             query('SELECT 1', fetch=True)
             result = {'status': 'ok'}
+        elif path == '/api/register' and method == 'POST':
+            data = read_json(environ)
+            username, password, full_name, email = (data.get(key) for key in ('username', 'password', 'full_name', 'email'))
+            if not all(isinstance(v, str) for v in (username, password, full_name, email)):
+                raise ValueError()
+            username, full_name, email = username.strip().lower(), full_name.strip(), email.strip().lower()
+            if not re.fullmatch(r'[a-z0-9_]{3,32}', username) or not 8 <= len(password) <= 256 or not 2 <= len(full_name) <= 100 or len(email) > 254 or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email):
+                status, result = '400 Bad Request', {'error': 'أدخل اسماً وبريداً صحيحين، واسم مستخدم من 3–32 حرفاً إنجليزياً أو رقماً أو _، وكلمة مرور من 8 أحرف على الأقل'}
+            else:
+                salt = secrets.token_hex(16)
+                digest = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 300000).hex()
+                try:
+                    with database() as conn:
+                        mark = '%s' if DATABASE_URL else '?'
+                        conn.execute('INSERT INTO users (username, password_hash, role) VALUES (' + ','.join([mark]*3) + ')', (username, salt + ':' + digest, 'user'))
+                        conn.execute('INSERT INTO profiles (username, full_name, email) VALUES (' + ','.join([mark]*3) + ')', (username, full_name, email))
+                    status, result = '201 Created', {'registered': True, 'username': username, 'role': 'user'}
+                except Exception as exc:
+                    if isinstance(exc, sqlite3.IntegrityError) or getattr(exc, 'sqlstate', '') == '23505':
+                        status, result = '409 Conflict', {'error': 'اسم المستخدم أو البريد مستخدم من قبل'}
+                    else:
+                        raise
+        elif path == '/api/dashboard' and method == 'GET':
+            user = current_user(environ)
+            if not user:
+                status, result = '401 Unauthorized', {'error': 'يرجى تسجيل الدخول'}
+            else:
+                stats = query('SELECT COUNT(*), COALESCE(SUM(found),0) FROM checks WHERE username = ?', (user[0],), True)
+                profile = query('SELECT full_name, email FROM profiles WHERE username = ?', (user[0],), True)
+                with database() as conn:
+                    sql = 'SELECT record_id, found, checked_at FROM checks WHERE username = ? ORDER BY checked_at DESC, event_id DESC LIMIT 10'
+                    rows = conn.execute(sql.replace('?', '%s') if DATABASE_URL else sql, (user[0],)).fetchall()
+                result = {'full_name': profile[0] if profile else user[0], 'checks': stats[0], 'matches': stats[1], 'history': [{'id': r[0], 'exists': bool(r[1]), 'checked_at': r[2]} for r in rows]}
+                if user[1] == 'admin':
+                    result['records'] = query('SELECT COUNT(*) FROM records', fetch=True)[0]
+                    result['users'] = query('SELECT COUNT(*) FROM users', fetch=True)[0]
         elif path == '/api/login' and method == 'POST':
             data = read_json(environ)
             username, password = data.get('username'), data.get('password')
@@ -134,7 +173,9 @@ def application(environ, start_response):
                 if not isinstance(record_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', record_id):
                     raise ValueError()
                 if path == '/api/check':
-                    result = {'id': record_id, 'exists': query('SELECT 1 FROM records WHERE id = ?', (record_id,), True) is not None}
+                    found = query('SELECT 1 FROM records WHERE id = ?', (record_id,), True) is not None
+                    query('INSERT INTO checks (event_id, username, record_id, found, checked_at) VALUES (?, ?, ?, ?, ?)', (secrets.token_hex(16), user[0], record_id, int(found), int(time.time())))
+                    result = {'id': record_id, 'exists': found}
                 elif method == 'POST':
                     query('INSERT INTO records (id) VALUES (?) ON CONFLICT (id) DO NOTHING', (record_id,))
                     result = {'id': record_id, 'saved': True}
