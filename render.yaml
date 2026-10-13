@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: id-check-api
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -c "from app import init_db; init_db()" && gunicorn app:application --bind 0.0.0.0:$PORT --workers 2 --timeout 30
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: id-check-db
+          property: connectionString
+      - key: ADMIN_TOKEN
+        generateValue: true
+
+databases:
+  - name: id-check-db
+    plan: free
+    region: frankfurt
+    ipAllowList: []
