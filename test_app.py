@@ -4,6 +4,9 @@ import app
 
 class ApiTest(unittest.TestCase):
  def setUp(self):
+  # These existing tests isolate business behavior; NFC rejection is tested separately.
+  gate = patch.object(app.nfc_verification, 'verify_and_accept')
+  gate.start();self.addCleanup(gate.stop)
   self.tmp=tempfile.TemporaryDirectory();app.DATABASE_URL='';app.SQLITE_PATH=self.tmp.name+'/test.db';app.init_db()
   self.admin=self.request('/api/login',data={'username':'abo_liath','password':'123456'})[1]['token']
  def tearDown(self):self.tmp.cleanup()

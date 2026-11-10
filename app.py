@@ -16,6 +16,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from wsgiref.simple_server import make_server
 
+import nfc_verification
+
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 SQLITE_PATH = os.environ.get('SQLITE_PATH', 'local.db')
 SESSION_SECONDS = 28800
@@ -83,6 +85,7 @@ def init_db():
     with database() as conn:
         for sql in schemas:
             execute(conn, sql)
+        nfc_verification.init_counter_schema(conn, execute)
         for username, role in [('abo_liath', 'admin'), ('jehad', 'user')]:
             execute(conn, 'INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?) ON CONFLICT (username) DO NOTHING', (username, password_hash('123456'), role))
         # Existing accounts remain usable; newly registered accounts explicitly start unverified.
@@ -421,7 +424,12 @@ def handle(environ, extra_headers, cookie_flags):
             result.update(records=query('SELECT COUNT(*) FROM records', fetch=True)[0], users=query("SELECT COUNT(*) FROM users WHERE role = 'admin'", fetch=True)[0], email_configured=mail_configured())
         return 200, result
     if path == '/api/check' and method == 'POST':
-        record_id = valid_id(read_json(environ).get('id'))
+        scan_request = read_json(environ)
+        record_id = valid_id(scan_request.get('id'))
+        try:
+            nfc_verification.verify_and_accept(scan_request, database, execute)
+        except nfc_verification.VerificationError as exc:
+            raise ApiError(exc.status, exc.message) from None
         with database() as conn:
             item = enrich_record(conn, record_dict(execute(conn, RECORD_SELECT + ' WHERE r.id = ?', (record_id,)).fetchone()))
         if not item or not item['active']:
